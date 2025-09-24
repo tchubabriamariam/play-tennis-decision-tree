@@ -3,46 +3,36 @@ import pandas as pd
 from collections import Counter
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
+from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
 
 # -----------------------
-# 1. Dataset
+# 1. Load dataset
 # -----------------------
-data = pd.DataFrame([
-    ['Sunny', 'Hot', 'High', 'Weak', 'No'],
-    ['Sunny', 'Hot', 'High', 'Strong', 'No'],
-    ['Overcast', 'Hot', 'High', 'Weak', 'Yes'],
-    ['Rain', 'Mild', 'High', 'Weak', 'Yes'],
-    ['Rain', 'Cool', 'Normal', 'Weak', 'Yes'],
-    ['Rain', 'Cool', 'Normal', 'Strong', 'No'],
-    ['Overcast', 'Cool', 'Normal', 'Strong', 'Yes'],
-    ['Sunny', 'Mild', 'High', 'Weak', 'No'],
-    ['Sunny', 'Cool', 'Normal', 'Weak', 'Yes'],
-    ['Rain', 'Mild', 'Normal', 'Weak', 'Yes'],
-    ['Sunny', 'Mild', 'Normal', 'Strong', 'Yes'],
-    ['Overcast', 'Mild', 'High', 'Strong', 'Yes'],
-    ['Overcast', 'Hot', 'Normal', 'Weak', 'Yes'],
-    ['Rain', 'Mild', 'High', 'Strong', 'No']
-], columns=['Outlook', 'Temperature', 'Humidity', 'Wind', 'PlayTennis'])
-
-X = data.drop('PlayTennis', axis=1)
-y = data['PlayTennis']
+iris = load_iris()
+X = pd.DataFrame(iris.data, columns=iris.feature_names)
+y = pd.Series(iris.target)
 
 # -----------------------
-# 2. Encode categorical features for black-box
+# 2. Encode categorical if needed (Iris is numeric, so skip)
 # -----------------------
-encoders = {col: LabelEncoder().fit(X[col]) for col in X.columns}
-X_enc = pd.DataFrame({col: encoders[col].transform(X[col]) for col in X.columns})
-y_enc = LabelEncoder().fit_transform(y)
+X_enc = X.copy()
+y_enc = y.copy()
 
 # -----------------------
-# 3. Train black-box (Random Forest)
+# 3. Split into train/test
 # -----------------------
-blackbox = RandomForestClassifier(n_estimators=50, random_state=42)
-blackbox.fit(X_enc, y_enc)
-y_blackbox = blackbox.predict(X_enc)  # predictions on the same dataset
+X_train, X_test, y_train, y_test = train_test_split(X_enc, y_enc, test_size=0.4, random_state=42)
 
 # -----------------------
-# 4. Quinlan ID3 surrogate tree implementation
+# 4. Train black-box
+# -----------------------
+blackbox = RandomForestClassifier(n_estimators=100, random_state=42)
+blackbox.fit(X_train, y_train)
+y_pred_blackbox = blackbox.predict(X_test)
+
+# -----------------------
+# 5. Quinlan ID3 surrogate implementation
 # -----------------------
 def entropy(target_col):
     counts = Counter(target_col)
@@ -62,7 +52,7 @@ class DecisionTreeNode:
     def __init__(self, feature=None, label=None):
         self.feature = feature
         self.label = label
-        self.children = {}  # value -> subtree
+        self.children = {}
 
 def build_id3(data, target, features):
     labels = data[target].unique()
@@ -81,13 +71,6 @@ def build_id3(data, target, features):
             node.children[val] = build_id3(subset, target, [f for f in features if f != best_feature])
     return node
 
-def extract_rules(node, path=""):
-    if node.label is not None:
-        print(path[:-5] + f" THEN Label={node.label}")
-        return
-    for val, child in node.children.items():
-        extract_rules(child, path + f"IF {node.feature}={val} AND ")
-
 def predict_id3(node, sample):
     if node.label is not None:
         return node.label
@@ -95,34 +78,38 @@ def predict_id3(node, sample):
     if val in node.children:
         return predict_id3(node.children[val], sample)
     else:
-        # fallback to majority label of children
         return Counter([child.label for child in node.children.values() if child.label]).most_common(1)[0][0]
 
+def extract_rules(node, path=""):
+    if node.label is not None:
+        print(path[:-5] + f" THEN Label={node.label}")
+        return
+    for val, child in node.children.items():
+        extract_rules(child, path + f"IF {node.feature}={val} AND ")
+
 # -----------------------
-# 5. Build surrogate tree on black-box predictions
+# 6. Build surrogate tree on black-box predictions
 # -----------------------
-df_surrogate = X.copy()
-df_surrogate["Label"] = y_blackbox
+df_surrogate = X_test.copy()
+df_surrogate["Label"] = y_pred_blackbox
 surrogate_tree = build_id3(df_surrogate, "Label", list(X.columns))
 
 # -----------------------
-# 6. Extract rules
+# 7. Extract rules
 # -----------------------
-print("Extracted Rules (Quinlan ID3 Surrogate):")
+print("Extracted rules from surrogate tree:")
 extract_rules(surrogate_tree)
 
 # -----------------------
-# 7. Compute fidelity and accuracy
+# 8. Compute fidelity and accuracy
 # -----------------------
-# Fidelity: agreement with black-box
-correct_fidelity = sum(predict_id3(surrogate_tree, row)==y_blackbox[i] 
-                       for i,row in enumerate(X.to_dict(orient="records")))
-fidelity = correct_fidelity / len(y_blackbox)
+correct_fidelity = sum(predict_id3(surrogate_tree, row) == y_pred_blackbox[i] 
+                       for i,row in enumerate(X_test.to_dict(orient="records")))
+fidelity = correct_fidelity / len(y_pred_blackbox)
 
-# Accuracy: agreement with true labels
-correct_accuracy = sum(predict_id3(surrogate_tree, row)==y_enc[i] 
-                       for i,row in enumerate(X.to_dict(orient="records")))
-accuracy = correct_accuracy / len(y_blackbox)
+correct_accuracy = sum(predict_id3(surrogate_tree, row) == y_test.iloc[i] 
+                       for i,row in enumerate(X_test.to_dict(orient="records")))
+accuracy = correct_accuracy / len(y_pred_blackbox)
 
 # Rule complexity
 def count_rules(node):
