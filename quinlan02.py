@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 
@@ -14,26 +13,34 @@ X = pd.DataFrame(iris.data, columns=iris.feature_names)
 y = pd.Series(iris.target)
 
 # -----------------------
-# 2. Encode categorical if needed (Iris is numeric, so skip)
+# 2. Split into train/test
 # -----------------------
-X_enc = X.copy()
-y_enc = y.copy()
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.4, random_state=42)
 
 # -----------------------
-# 3. Split into train/test
-# -----------------------
-X_train, X_test, y_train, y_test = train_test_split(X_enc, y_enc, test_size=0.4, random_state=42)
-
-# -----------------------
-# 4. Train black-box
+# 3. Train black-box
 # -----------------------
 blackbox = RandomForestClassifier(n_estimators=100, random_state=42)
 blackbox.fit(X_train, y_train)
 y_pred_blackbox = blackbox.predict(X_test)
 
 # -----------------------
-# 5. Quinlan ID3 surrogate implementation
+# 4. Discretize features (4 bins for fewer rules)
 # -----------------------
+def discretize(df, bins=4):
+    df_disc = df.copy()
+    for col in df.columns:
+        df_disc[col] = pd.qcut(df[col], q=bins, labels=False, duplicates='drop')
+    return df_disc
+
+X_train_disc = discretize(X_train, bins=4)
+X_test_disc = discretize(X_test, bins=4)
+
+# -----------------------
+# 5. ID3 with minimum samples to prevent overfitting
+# -----------------------
+MIN_SAMPLES_LEAF = 5  # stop splitting small subsets
+
 def entropy(target_col):
     counts = Counter(target_col)
     total = len(target_col)
@@ -55,14 +62,20 @@ class DecisionTreeNode:
         self.children = {}
 
 def build_id3(data, target, features):
+    # Stop if subset too small
+    if len(data) < MIN_SAMPLES_LEAF:
+        return DecisionTreeNode(label=Counter(data[target]).most_common(1)[0][0])
+    
     labels = data[target].unique()
     if len(labels) == 1:
         return DecisionTreeNode(label=labels[0])
     if not features:
         return DecisionTreeNode(label=Counter(data[target]).most_common(1)[0][0])
+    
     gains = [info_gain(data, f, target) for f in features]
     best_feature = features[np.argmax(gains)]
     node = DecisionTreeNode(feature=best_feature)
+    
     for val in data[best_feature].unique():
         subset = data[data[best_feature] == val]
         if subset.empty:
@@ -71,14 +84,18 @@ def build_id3(data, target, features):
             node.children[val] = build_id3(subset, target, [f for f in features if f != best_feature])
     return node
 
-def predict_id3(node, sample):
+# Safe prediction with fallback
+def predict_id3(node, sample, default=None):
     if node.label is not None:
         return node.label
-    val = sample[node.feature]
+    val = sample.get(node.feature)
     if val in node.children:
-        return predict_id3(node.children[val], sample)
+        return predict_id3(node.children[val], sample, default)
     else:
-        return Counter([child.label for child in node.children.values() if child.label]).most_common(1)[0][0]
+        leaf_labels = [child.label for child in node.children.values() if child.label is not None]
+        if leaf_labels:
+            return Counter(leaf_labels).most_common(1)[0][0]
+        return default
 
 def extract_rules(node, path=""):
     if node.label is not None:
@@ -88,27 +105,35 @@ def extract_rules(node, path=""):
         extract_rules(child, path + f"IF {node.feature}={val} AND ")
 
 # -----------------------
-# 6. Build surrogate tree on black-box predictions
+# 6. Build surrogate on training black-box predictions
 # -----------------------
-df_surrogate = X_test.copy()
-df_surrogate["Label"] = y_pred_blackbox
-surrogate_tree = build_id3(df_surrogate, "Label", list(X.columns))
+df_surrogate = X_train_disc.copy()
+df_surrogate["Label"] = blackbox.predict(X_train)
+surrogate_tree = build_id3(df_surrogate, "Label", list(X_train_disc.columns))
+
+most_common_label = Counter(df_surrogate["Label"]).most_common(1)[0][0]
 
 # -----------------------
-# 7. Extract rules
+# 7. Extract human-readable rules
 # -----------------------
 print("Extracted rules from surrogate tree:")
 extract_rules(surrogate_tree)
 
 # -----------------------
-# 8. Compute fidelity and accuracy
+# 8. Compute fidelity and accuracy on test set
 # -----------------------
-correct_fidelity = sum(predict_id3(surrogate_tree, row) == y_pred_blackbox[i] 
-                       for i,row in enumerate(X_test.to_dict(orient="records")))
+X_test_records = X_test_disc.to_dict(orient="records")
+
+correct_fidelity = sum(
+    predict_id3(surrogate_tree, row, default=most_common_label) == y_pred_blackbox[i]
+    for i,row in enumerate(X_test_records)
+)
 fidelity = correct_fidelity / len(y_pred_blackbox)
 
-correct_accuracy = sum(predict_id3(surrogate_tree, row) == y_test.iloc[i] 
-                       for i,row in enumerate(X_test.to_dict(orient="records")))
+correct_accuracy = sum(
+    predict_id3(surrogate_tree, row, default=most_common_label) == y_test.iloc[i]
+    for i,row in enumerate(X_test_records)
+)
 accuracy = correct_accuracy / len(y_pred_blackbox)
 
 # Rule complexity
